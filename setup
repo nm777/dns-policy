@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Initialize local dns-policy files and Kea read permissions without changing DHCP."""
+import argparse
+import base64
+import os
+from pathlib import Path
+import runpy
+import secrets
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent
+RUNTIME = ROOT / "staging/dnsdist"
+
+
+def create_private(path, raw):
+    """Create once; never reset an existing console key, config, or policy."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "wb") as output:
+        output.write(raw)
+
+
+def initialize(runtime, template):
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if runtime.stat().st_uid != os.getuid():
+        raise RuntimeError(f"{runtime} must be owned by the setup user")
+    runtime.chmod(0o700)
+    create_private(runtime / "dnsdist.conf", template.read_bytes())
+    create_private(runtime / "console.key", base64.b64encode(secrets.token_bytes(32)) + b"\n")
+    create_private(runtime / "policy.state", f"DNSPOLICYv1\t{secrets.token_hex(32)}\n".encode("ascii"))
+    for name in ("dnsdist.conf", "console.key", "policy.state"):
+        path = runtime / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_uid != os.getuid():
+            raise RuntimeError(f"{path} must be a regular file owned by the setup user")
+        path.chmod(0o600)
+    key = (runtime / "console.key").read_bytes().strip()
+    if len(base64.b64decode(key, validate=True)) != 32:
+        raise RuntimeError("console.key must contain a base64-encoded 32-byte key")
+    policy = runpy.run_path(str(ROOT / "dns-policy"))
+    policy["parse_state"]((runtime / "policy.state").read_bytes())
+
+
+def grant_kea_access(uid):
+    subprocess.run(["sudo", "setfacl", "-m", f"u:{uid}:--x", "/etc/kea"], check=True)
+    subprocess.run(
+        ["sudo", "setfacl", "-m", f"u:{uid}:r-x,d:u:{uid}:r-x", "/var/lib/kea"], check=True
+    )
+    journals = sorted(Path("/var/lib/kea").glob("kea-leases4.csv*"))
+    for path in journals:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"unexpected lease journal: {path}")
+    if journals:
+        subprocess.run(
+            ["sudo", "setfacl", "-m", f"u:{uid}:r--", *map(str, journals)], check=True
+        )
+    # The live config is normally 0644; also support packages using 0640.
+    subprocess.run(
+        ["sudo", "setfacl", "-m", f"u:{uid}:r--", "/etc/kea/kea-dhcp4.conf"], check=True
+    )
+
+
+def install_link(bin_dir):
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / "dns-policy"
+    if link.exists() and not link.is_symlink():
+        raise RuntimeError(f"refusing to replace non-symlink {link}")
+    if link.is_symlink():
+        if link.resolve() == ROOT / "dns-policy":
+            return
+        link.unlink()
+    link.symlink_to(ROOT / "dns-policy")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--adopt", type=Path, metavar="DIRECTORY",
+                        help="link an existing dnsdist runtime directory instead of creating a new one")
+    parser.add_argument("--start", action="store_true", help="validate and start/recreate the dnsdist container")
+    parser.add_argument("--skip-permissions", action="store_true", help="keep existing Kea permissions (no sudo)")
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        parser.error("run ./setup without sudo; it requests sudo only for Kea ACLs")
+    tools = ("docker",) if args.skip_permissions else ("docker", "sudo", "setfacl")
+    for tool in tools:
+        if shutil.which(tool) is None:
+            raise RuntimeError(f"missing command: {tool}; see README.md prerequisites")
+    subprocess.run(["docker", "compose", "version"], check=True)
+    if args.adopt:
+        source = args.adopt.expanduser().resolve(strict=True)
+        if not source.is_dir():
+            raise RuntimeError(f"not a runtime directory: {source}")
+        for name in ("dnsdist.conf", "console.key", "policy.state"):
+            if not (source / name).is_file():
+                raise RuntimeError(f"cannot adopt: missing {source / name}")
+        if RUNTIME.exists() or RUNTIME.is_symlink():
+            if RUNTIME.resolve() != source:
+                raise RuntimeError(f"{RUNTIME} already exists and points elsewhere")
+        else:
+            RUNTIME.parent.mkdir(parents=True, exist_ok=True)
+            RUNTIME.symlink_to(source, target_is_directory=True)
+    initialize(RUNTIME, ROOT / "config/dnsdist.conf")
+    env = f"DNS_POLICY_UID={os.getuid()}\nDNS_POLICY_GID={os.getgid()}\n".encode("ascii")
+    create_private(ROOT / ".env", env)
+    if (ROOT / ".env").read_bytes() != env:
+        raise RuntimeError(".env UID/GID differs from the setup user; correct it before continuing")
+    if not args.skip_permissions:
+        grant_kea_access(os.getuid())
+    install_link(Path.home() / ".local/bin")
+    subprocess.run(["docker", "compose", "config", "--quiet"], cwd=ROOT, check=True)
+    if args.start:
+        subprocess.run([
+            "docker", "compose", "run", "--rm", "--no-deps", "dnsdist",
+            "--check-config", "-C", "/etc/dnsdist/dnsdist.conf",
+        ], cwd=ROOT, check=True)
+        subprocess.run(["docker", "compose", "up", "-d"], cwd=ROOT, check=True)
+    print(f"CLI installed: {Path.home() / '.local/bin/dns-policy'}")
+    print(f"Runtime directory: {RUNTIME.resolve()}")
+    print("Run dns-policy list to verify saved/live synchronization.")
+    if not args.start:
+        print("Container left running as-is. For a new deployment, review the config then run ./setup --start.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"setup: error: {error}", file=sys.stderr)
+        raise SystemExit(1)

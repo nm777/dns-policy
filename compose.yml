@@ -1,0 +1,35 @@
+name: dns-policy-staging
+
+services:
+  dnsdist:
+    image: powerdns/dnsdist-21@sha256:28100b260120b2f4fdcef6e973f5553966977c2ec4576ed2d849b1dc9d3278ea
+    user: "0:0"
+    entrypoint:
+      - /usr/bin/setpriv
+      - --reuid
+      - "${DNS_POLICY_UID:?Run ./setup first}"
+      - --regid
+      - "${DNS_POLICY_GID:?Run ./setup first}"
+      - --clear-groups
+      - --inh-caps
+      - +net_bind_service
+      - --ambient-caps
+      - +net_bind_service
+      - --
+      - /usr/bin/tini
+      - --
+      - /usr/local/bin/dnsdist
+    command: [--supervised, --disable-syslog, -C, /etc/dnsdist/dnsdist.conf]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETGID, SETUID]
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    volumes:
+      - type: bind
+        source: ./staging/dnsdist
+        target: /etc/dnsdist
+        read_only: true
+        bind:
+          create_host_path: false

@@ -1,0 +1,1367 @@
+#!/usr/bin/env python3
+import copy
+import csv
+import fcntl
+import ipaddress
+import io
+import json
+import os
+import re
+import secrets
+import socket
+import stat
+import subprocess
+import sys
+import syslog
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parent
+POLICY_DIR = ROOT / "staging/dnsdist"
+STATE = POLICY_DIR / "policy.state"
+LOCK = POLICY_DIR / ".policy.lock"
+KEA = Path("/etc/kea/kea-dhcp4.conf")
+KEA_LOCK = Path("/run/lock/dns-policy-kea-reserve.lock")
+KEA_SOCKET = Path("/run/kea/kea4-ctrl-socket")
+KEA_SERVICE = "kea-dhcp4-server.service"
+LEASES = Path("/var/lib/kea/kea-leases4.csv")
+CONTAINER = "dns-policy-staging-dnsdist-1"
+MAX_EXPIRY = 253402300799
+HEADER = "DNSPOLICYv1"
+HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+MAC = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}")
+
+
+class PolicyError(Exception):
+    pass
+
+
+def serialize(entries, generation=None):
+    payload = "".join(
+        f"{ip}\tpermanent\n" if value is None else f"{ip}\texpires\t{value}\n"
+        for ip, value in sorted(entries.items())
+    )
+    generation = generation or secrets.token_hex(32)
+    return f"{HEADER}\t{generation}\n{payload}".encode("ascii"), generation
+
+
+def parse_state(raw, now=None):
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise PolicyError("policy state is not ASCII") from error
+    lines = text.splitlines()
+    if not lines or not re.fullmatch(rf"{HEADER}\t[0-9a-f]{{64}}", lines[0]):
+        raise PolicyError("policy state has an invalid header")
+    entries = {}
+    for number, line in enumerate(lines[1:], 2):
+        fields = line.split("\t")
+        try:
+            ip = str(ipaddress.IPv4Address(fields[0]))
+        except (ipaddress.AddressValueError, IndexError) as error:
+            raise PolicyError(f"policy state line {number} has an invalid IPv4 address") from error
+        if ip != fields[0] or ip in entries:
+            raise PolicyError(f"policy state line {number} is non-canonical or duplicated")
+        if fields[1:] == ["permanent"]:
+            entries[ip] = None
+        elif len(fields) == 3 and fields[1] == "expires" and re.fullmatch(r"[1-9][0-9]*", fields[2]):
+            expiry = int(fields[2])
+            if expiry > MAX_EXPIRY:
+                raise PolicyError(f"policy state line {number} has an overflowing expiry")
+            entries[ip] = expiry
+        else:
+            raise PolicyError(f"policy state line {number} has an invalid policy")
+    generation = lines[0].split("\t")[1]
+    canonical, _ = serialize(entries, generation)
+    if canonical != raw:
+        raise PolicyError("policy state is non-canonical")
+    now = int(time.time()) if now is None else now
+    active = {ip: value for ip, value in entries.items() if value is None or value > now}
+    return active, generation, active != entries
+
+
+def replace_state(raw):
+    fd, temporary = tempfile.mkstemp(prefix=".policy.state.", dir=POLICY_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, STATE)
+        directory = os.open(POLICY_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_state(entries):
+    raw, generation = serialize(entries)
+    replace_state(raw)
+    return generation
+
+
+def strict_json(raw):
+    def object_without_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=object_without_duplicates,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid constant {value}")),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise PolicyError(f"invalid strict JSON: {error}") from error
+
+
+def read_kea_config():
+    try:
+        return strict_json(KEA.read_bytes())
+    except (OSError, PolicyError) as error:
+        raise PolicyError(f"cannot read valid Kea configuration {KEA}: {error}") from error
+
+
+def reservation_records(config, strict=False):
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "reservations":
+                    if not isinstance(child, list):
+                        if strict:
+                            raise PolicyError("Kea configuration contains a non-array reservations value")
+                        walk(child)
+                        continue
+                    for item in child:
+                        if isinstance(item, dict):
+                            found.append(item)
+                        elif strict:
+                            raise PolicyError("Kea configuration contains a non-object reservation")
+                else:
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(config)
+    return found
+
+
+def reservations():
+    return reservation_records(read_kea_config())
+
+
+def valid_hostname(value):
+    return isinstance(value, str) and HOSTNAME.fullmatch(value) is not None
+
+
+def private_mac(value):
+    return isinstance(value, str) and MAC.fullmatch(value.lower()) is not None and bool(int(value[:2], 16) & 2)
+
+
+def kea_reservation_candidate(config, lease, hostname):
+    if not valid_hostname(hostname):
+        raise PolicyError("hostname must be a lowercase DNS label of at most 63 characters")
+    try:
+        ip = str(ipaddress.IPv4Address(lease["ip"]))
+        mac = lease["mac"]
+        subnet_id = lease["subnet_id"]
+    except (KeyError, TypeError, ipaddress.AddressValueError) as error:
+        raise PolicyError("lease has no valid reservation identity") from error
+    if ip != lease["ip"] or not isinstance(mac, str) or MAC.fullmatch(mac) is None or mac != mac.lower():
+        raise PolicyError("lease has no valid canonical IP/MAC identity")
+    if type(subnet_id) is not int or subnet_id < 0:
+        raise PolicyError("lease has no valid subnet-id")
+
+    candidate = copy.deepcopy(config)
+    try:
+        dhcp4 = candidate["Dhcp4"]
+        subnets = dhcp4["subnet4"]
+    except (KeyError, TypeError) as error:
+        raise PolicyError("Kea configuration has no usable Dhcp4.subnet4") from error
+    if not isinstance(dhcp4, dict) or not isinstance(subnets, list):
+        raise PolicyError("Kea configuration has no usable Dhcp4.subnet4")
+
+    for record in reservation_records(candidate, strict=True):
+        if "ip-address" in record:
+            try:
+                reserved_ip = str(ipaddress.IPv4Address(record["ip-address"]))
+            except (TypeError, ipaddress.AddressValueError) as error:
+                raise PolicyError("Kea configuration contains an invalid reservation IP") from error
+            if reserved_ip == ip:
+                raise PolicyError(f"reservation IP already exists: {ip}")
+        if "hw-address" in record:
+            reserved_mac = record["hw-address"]
+            if not isinstance(reserved_mac, str) or MAC.fullmatch(reserved_mac.lower()) is None:
+                raise PolicyError("Kea configuration contains an invalid reservation MAC")
+            if reserved_mac.lower() == mac:
+                raise PolicyError(f"reservation MAC already exists: {mac}")
+        if "hostname" in record:
+            reserved_hostname = record["hostname"]
+            if not isinstance(reserved_hostname, str):
+                raise PolicyError("Kea configuration contains an invalid reservation hostname")
+            if reserved_hostname.lower() == hostname.lower():
+                raise PolicyError(f"reservation hostname already exists: {hostname}")
+
+    address = ipaddress.IPv4Address(ip)
+    matches = []
+    for subnet in subnets:
+        if not isinstance(subnet, dict):
+            raise PolicyError("Kea configuration contains a non-object subnet4 entry")
+        try:
+            network = ipaddress.IPv4Network(subnet["subnet"], strict=False)
+        except (KeyError, TypeError, ipaddress.AddressValueError, ipaddress.NetmaskValueError) as error:
+            raise PolicyError("Kea configuration contains an invalid subnet4 network") from error
+        if subnet.get("id") == subnet_id and address in network:
+            matches.append(subnet)
+    if len(matches) != 1:
+        raise PolicyError(
+            f"expected exactly one subnet4 with id {subnet_id} containing {ip}, found {len(matches)}"
+        )
+    target = matches[0].get("reservations")
+    if not isinstance(target, list):
+        raise PolicyError("matching subnet4 has no reservations array")
+    target.append({"hw-address": mac, "ip-address": ip, "hostname": hostname})
+    return candidate
+
+
+def replay_leases(journals, now=None):
+    leases = {}
+    required = {"address", "hwaddr", "expire", "hostname", "state", "subnet_id"}
+    for source, raw in journals:
+        try:
+            reader = csv.DictReader(io.StringIO(raw.decode("utf-8"), newline=""), strict=True)
+            missing = required - set(reader.fieldnames or ())
+            if missing:
+                raise PolicyError(f"Kea lease journal {source} is missing headers: {', '.join(sorted(missing))}")
+            for row in reader:
+                if None in row or any(row.get(field) is None for field in required):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has malformed columns")
+                try:
+                    ip = str(ipaddress.IPv4Address(row["address"]))
+                except ipaddress.AddressValueError as error:
+                    raise PolicyError(
+                        f"Kea lease journal {source} line {reader.line_num} has an invalid IPv4 address"
+                    ) from error
+                mac = row["hwaddr"].lower()
+                if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an invalid MAC")
+                if not re.fullmatch(r"[0-9]+", row["state"]):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an invalid state")
+                if not re.fullmatch(r"[0-9]+", row["expire"]):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an invalid expiry")
+                if not re.fullmatch(r"[0-9]+", row["subnet_id"]):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an invalid subnet-id")
+                state = 0 if not row["state"].strip("0") else 1
+                expiry_text = row["expire"].lstrip("0") or "0"
+                if len(expiry_text) > len(str(MAX_EXPIRY)):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an overflowing expiry")
+                expiry = int(expiry_text)
+                if expiry > MAX_EXPIRY:
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an overflowing expiry")
+                subnet_text = row["subnet_id"].lstrip("0") or "0"
+                if len(subnet_text) > 10 or int(subnet_text) > 4294967295:
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an invalid subnet-id")
+                hostname = row["hostname"].removesuffix(".")
+                if any(not character.isprintable() for character in hostname):
+                    raise PolicyError(f"Kea lease journal {source} line {reader.line_num} has an invalid hostname")
+                leases[ip] = {
+                    "ip": ip,
+                    "mac": mac,
+                    "hostname": hostname,
+                    "state": state,
+                    "expiry": expiry,
+                    "subnet_id": int(subnet_text),
+                }
+        except (UnicodeDecodeError, csv.Error) as error:
+            raise PolicyError(f"cannot parse Kea lease journal {source}: {error}") from error
+    now = int(time.time()) if now is None else now
+    return {ip: lease for ip, lease in leases.items() if lease["state"] == 0 and lease["expiry"] > now}
+
+
+def active_leases(current=LEASES):
+    baseline = Path(str(current) + ".2")
+    artifacts = (Path(str(current) + ".1"), Path(str(current) + ".completed"))
+    paths = (baseline, current, *artifacts)
+
+    def signatures():
+        result = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                result.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+            except FileNotFoundError:
+                result.append(None)
+        return tuple(result)
+
+    detail = "lease files kept changing"
+    for _ in range(4):
+        try:
+            before = signatures()
+            if any(before[index] is not None for index in range(2, len(paths))):
+                detail = "Kea lease-file cleanup is in progress"
+                time.sleep(0.05)
+                continue
+            journals = []
+            if before[0] is not None:
+                journals.append((str(baseline), baseline.read_bytes()))
+            journals.append((str(current), current.read_bytes()))
+            after = signatures()
+            if before == after and not any(after[index] is not None for index in range(2, len(paths))):
+                return replay_leases(journals)
+        except OSError as error:
+            detail = str(error)
+        time.sleep(0.05)
+    raise PolicyError(f"cannot obtain a stable Kea lease snapshot: {detail}")
+
+
+def active_reservation_candidate(ip, mac, hostname):
+    try:
+        canonical_ip = str(ipaddress.IPv4Address(ip))
+    except ipaddress.AddressValueError as error:
+        raise PolicyError(f"invalid reservation IPv4 address: {ip}") from error
+    if canonical_ip != ip:
+        raise PolicyError(f"reservation IPv4 address is not canonical: {ip}")
+    if MAC.fullmatch(mac) is None or mac != mac.lower():
+        raise PolicyError(f"invalid canonical reservation MAC: {mac}")
+    if not valid_hostname(hostname):
+        raise PolicyError("hostname must be a lowercase DNS label of at most 63 characters")
+
+    leases = active_leases()
+    lease = leases.get(ip)
+    if not lease or lease["mac"] != mac:
+        raise PolicyError("selected active lease changed or disappeared; no reservation was created")
+    if sum(item["mac"] == mac for item in leases.values()) != 1:
+        raise PolicyError(f"active MAC is ambiguous: {mac}; no reservation was created")
+    config = read_kea_config()
+    return config, kea_reservation_candidate(config, lease, hostname)
+
+
+def read_live_kea_bytes():
+    try:
+        fd = os.open(KEA, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PolicyError(f"live Kea configuration is not a regular file: {KEA}")
+            if (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (0, 0, 0o644):
+                raise PolicyError("live Kea configuration must be root:root mode 0644")
+            with os.fdopen(fd, "rb") as source:
+                fd = None
+                return source.read()
+        finally:
+            if fd is not None:
+                os.close(fd)
+    except OSError as error:
+        raise PolicyError(f"cannot safely read live Kea configuration: {error}") from error
+
+
+def fsync_kea_directory():
+    directory = os.open(KEA.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def write_kea_temp(raw, mode, prefix):
+    fd, path = tempfile.mkstemp(prefix=prefix, dir=KEA.parent)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as output:
+            fd = None
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        return path
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def kea_control_reload():
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(10)
+            client.connect(str(KEA_SOCKET))
+            client.sendall(json.dumps({"command": "config-reload"}).encode("ascii"))
+            client.shutdown(socket.SHUT_WR)
+            raw = b""
+            while len(raw) <= 1024 * 1024:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+                try:
+                    response = strict_json(raw)
+                    break
+                except PolicyError:
+                    continue
+            else:
+                raise PolicyError("Kea config-reload response exceeded 1 MiB")
+    except (OSError, TimeoutError) as error:
+        raise PolicyError(f"Kea config-reload control request failed: {error}") from error
+    try:
+        reply = response[0] if isinstance(response, list) and len(response) == 1 else response
+    except UnboundLocalError as error:
+        raise PolicyError("Kea config-reload returned an empty or invalid response") from error
+    if not isinstance(reply, dict) or type(reply.get("result")) is not int:
+        raise PolicyError("Kea config-reload returned an invalid response")
+    if reply["result"] != 0:
+        raise PolicyError(f"Kea config-reload failed: {reply.get('text', '')} (result {reply['result']})")
+
+
+def require_kea_active():
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "--quiet", KEA_SERVICE],
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PolicyError(f"cannot verify {KEA_SERVICE}: {error}") from error
+    if result.returncode:
+        raise PolicyError(f"{KEA_SERVICE} is not active")
+
+
+def install_kea_reservation(ip, mac, hostname):
+    lock_fd = os.open(KEA_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    stage = None
+    try:
+        os.fchown(lock_fd, 0, 0)
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        original = read_live_kea_bytes()
+        config = strict_json(original)
+        if not isinstance(config, dict) or not isinstance(config.get("Dhcp4"), dict):
+            raise PolicyError("live Kea configuration has no Dhcp4 object")
+        control = config["Dhcp4"].get("control-socket", {})
+        if control != {"socket-type": "unix", "socket-name": str(KEA_SOCKET)}:
+            raise PolicyError("live Kea control-socket configuration is not the expected local UNIX socket")
+        current_config, candidate = active_reservation_candidate(ip, mac, hostname)
+        if current_config != config:
+            raise PolicyError("live Kea configuration changed during reservation validation")
+        require_kea_active()
+        if not KEA_SOCKET.is_socket():
+            raise PolicyError(f"Kea control socket is unavailable: {KEA_SOCKET}")
+
+        candidate_raw = (json.dumps(candidate, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+        stage = write_kea_temp(candidate_raw, 0o644, ".kea-dhcp4.conf.reserve.")
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/kea-dhcp4", "-t", stage],
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise PolicyError(f"cannot validate Kea reservation candidate: {error}") from error
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise PolicyError(f"Kea reservation candidate failed kea-dhcp4 -t: {detail}")
+
+        backup = Path(str(KEA) + ".backup." + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"))
+        backup_fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchown(backup_fd, 0, 0)
+            os.fchmod(backup_fd, 0o600)
+            with os.fdopen(backup_fd, "wb") as output:
+                backup_fd = None
+                output.write(original)
+                output.flush()
+                os.fsync(output.fileno())
+        finally:
+            if backup_fd is not None:
+                os.close(backup_fd)
+        fsync_kea_directory()
+        backup_stat = backup.stat()
+        if (
+            backup.read_bytes() != original
+            or (backup_stat.st_uid, backup_stat.st_gid, stat.S_IMODE(backup_stat.st_mode)) != (0, 0, 0o600)
+        ):
+            raise PolicyError("Kea backup verification failed")
+
+        os.chown(stage, 0, 0)
+        os.chmod(stage, 0o644)
+        with open(stage, "rb") as candidate_file:
+            os.fsync(candidate_file.fileno())
+        if read_live_kea_bytes() != original:
+            raise PolicyError("live Kea configuration changed before installation; refusing replacement")
+
+        replaced = False
+        try:
+            os.replace(stage, KEA)
+            stage = None
+            replaced = True
+            fsync_kea_directory()
+            if read_live_kea_bytes() != candidate_raw:
+                raise PolicyError("installed Kea configuration bytes do not match the validated candidate")
+            kea_control_reload()
+            require_kea_active()
+            installed_raw = read_live_kea_bytes()
+            installed = strict_json(installed_raw)
+            exact = [
+                record for record in reservation_records(installed)
+                if isinstance(record, dict)
+                and record.get("ip-address") == ip
+                and str(record.get("hw-address", "")).lower() == mac
+                and record.get("hostname") == hostname
+            ]
+            if installed_raw != candidate_raw or len(exact) != 1:
+                raise PolicyError("installed Kea reservation could not be confirmed exactly")
+        except BaseException as original_error:
+            if not replaced:
+                raise
+            try:
+                if read_live_kea_bytes() != candidate_raw:
+                    raise PolicyError(
+                        "live Kea configuration changed after installation; refusing to overwrite unknown bytes"
+                    )
+                rollback_stage = write_kea_temp(original, 0o644, ".kea-dhcp4.conf.rollback.")
+                try:
+                    os.replace(rollback_stage, KEA)
+                    rollback_stage = None
+                    fsync_kea_directory()
+                finally:
+                    if rollback_stage is not None:
+                        os.unlink(rollback_stage)
+                if read_live_kea_bytes() != original:
+                    raise PolicyError("restored bytes differ from the original")
+                kea_control_reload()
+                require_kea_active()
+                if read_live_kea_bytes() != original:
+                    raise PolicyError("original bytes changed after rollback reload")
+            except BaseException as rollback_error:
+                raise PolicyError(
+                    f"reservation install failed ({original_error}); ROLLBACK FAILURE: {rollback_error}; "
+                    f"backup: {backup}"
+                ) from original_error
+            raise PolicyError(
+                f"reservation install failed ({original_error}); original configuration restored, reloaded, "
+                f"and verified; backup: {backup}"
+            ) from original_error
+        print(f"Backup: {backup}")
+        return 0
+    finally:
+        if stage is not None:
+            try:
+                os.unlink(stage)
+            except FileNotFoundError:
+                pass
+        os.close(lock_fd)
+
+
+def protected_inventory(entries, records, leases):
+    reserved = {}
+    for record in records:
+        if "ip-address" not in record:
+            continue
+        value = record["ip-address"]
+        if not isinstance(value, str):
+            raise PolicyError(f"reservation has an invalid fixed IPv4 address: {value!r}")
+        try:
+            ip = str(ipaddress.IPv4Address(value))
+        except ipaddress.AddressValueError as error:
+            raise PolicyError(f"reservation has an invalid fixed IPv4 address: {value!r}") from error
+        mac = record.get("hw-address", "")
+        if not isinstance(mac, str) or (mac and not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac.lower())):
+            raise PolicyError(f"reservation for {ip} has an invalid MAC")
+        name = record.get("hostname", "")
+        if not isinstance(name, str):
+            name = ""
+        reserved.setdefault(ip, []).append({"hostname": name.removesuffix("."), "mac": mac.lower()})
+
+    mac_ips = {}
+    for lease in leases.values():
+        mac_ips.setdefault(lease["mac"], set()).add(lease["ip"])
+    duplicate_macs = {mac for mac, ips in mac_ips.items() if len(ips) > 1}
+    rows = []
+    for ip, matches in reserved.items():
+        if ip in entries:
+            continue
+        lease = leases.get(ip)
+        reservation = matches[0]
+        mac = reservation["mac"] or (lease["mac"] if lease else "-")
+        name = reservation["hostname"] or (lease["hostname"] if lease else "") or "<unnamed>"
+        problems = []
+        if len(matches) != 1:
+            problems.append("ambiguous reservation")
+        if lease and reservation["mac"] and reservation["mac"] != lease["mac"]:
+            problems.append("lease MAC mismatch")
+        if mac in duplicate_macs or (lease and lease["mac"] in duplicate_macs):
+            problems.append("ambiguous active MAC")
+        rows.append({
+            "hostname": name,
+            "ip": ip,
+            "mac": mac,
+            "kind": "reserved",
+            "status": ", ".join(problems) or "ready",
+            "selectable": not problems,
+        })
+    for ip, lease in leases.items():
+        if ip in reserved or ip in entries:
+            continue
+        ambiguous = lease["mac"] in duplicate_macs
+        rows.append({
+            "hostname": lease["hostname"] or "<unnamed>",
+            "ip": ip,
+            "mac": lease["mac"],
+            "kind": "unreserved",
+            "status": "ambiguous active MAC" if ambiguous else "fixed reservation required",
+            "selectable": False,
+        })
+    return sorted(rows, key=lambda row: ipaddress.IPv4Address(row["ip"]))
+
+
+def resolve_device(target, records):
+    try:
+        address = ipaddress.ip_address(target)
+    except ValueError:
+        if re.fullmatch(r"[0-9.]+", target) or ":" in target:
+            raise PolicyError(f"malformed or unsupported IP address: {target}")
+        matches = [record for record in records if record.get("hostname") == target]
+    else:
+        if not isinstance(address, ipaddress.IPv4Address):
+            raise PolicyError(f"malformed or unsupported IP address: {target}")
+        matches = [record for record in records if record.get("ip-address") == str(address)]
+    if not matches:
+        raise PolicyError(f"unknown or unreserved device: {target}")
+    if len(matches) != 1 or "ip-address" not in matches[0]:
+        raise PolicyError(f"ambiguous device reservation: {target}")
+    try:
+        ip = str(ipaddress.IPv4Address(matches[0]["ip-address"]))
+    except (ipaddress.AddressValueError, TypeError) as error:
+        raise PolicyError(f"reservation for {target} has an invalid fixed IPv4 address") from error
+    if sum(record.get("ip-address") == ip for record in records) != 1:
+        raise PolicyError(f"reservation for {target} does not have a unique fixed IPv4 address")
+    return matches[0].get("hostname", target), ip
+
+
+def duration(value):
+    match = re.fullmatch(r"([1-9][0-9]*)([smhd])", value)
+    if not match:
+        raise PolicyError("duration must be a positive integer followed by s, m, h, or d")
+    seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    if int(time.time()) + seconds > MAX_EXPIRY:
+        raise PolicyError("duration overflows the supported Unix expiry range")
+    return seconds
+
+
+def console(command):
+    try:
+        result = subprocess.run(
+            [
+                "docker", "exec", "-i", "--user", f"{POLICY_DIR.stat().st_uid}:{POLICY_DIR.stat().st_gid}", CONTAINER,
+                "dnsdist", "-C", "/etc/dnsdist/dnsdist.conf", "-c",
+            ],
+            input=command + "\n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PolicyError(f"dnsdist console unavailable: {error}") from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise PolicyError(f"dnsdist console failed: {detail or f'exit {result.returncode}'}")
+    return result.stdout.strip()
+
+
+def live_state():
+    output = console("return policyStatus()")
+    try:
+        return parse_state((output + "\n").encode("ascii"), now=-1)[:2]
+    except (PolicyError, UnicodeEncodeError) as error:
+        raise PolicyError(f"dnsdist returned invalid live policy: {error}") from error
+
+
+def apply_live(entries, generation):
+    items = ",".join(
+        f'["{ip}"]="permanent"' if value is None else f'["{ip}"]={value}'
+        for ip, value in sorted(entries.items())
+    )
+    returned = console(f'return setPolicy({{{items}}},"{generation}")')
+    if returned != generation:
+        raise PolicyError(f"dnsdist acknowledged generation {returned!r}, expected {generation}")
+    live, live_generation = live_state()
+    if live_generation != generation or live != entries:
+        raise PolicyError("dnsdist live table did not match the applied generation")
+
+
+def persist_and_apply(entries):
+    try:
+        previous_raw = STATE.read_bytes()
+        previous_entries, previous_generation, _ = parse_state(previous_raw)
+    except OSError as error:
+        raise PolicyError(f"cannot preserve prior policy state: {error}") from error
+    try:
+        generation = write_state(entries)
+    except OSError as original:
+        try:
+            if STATE.read_bytes() == previous_raw:
+                recovery = "prior durable state is unchanged"
+            else:
+                replace_state(previous_raw)
+                recovery = "prior durable state was restored"
+        except OSError as fallback:
+            recovery = f"UNRECONCILED durable state ({fallback})"
+        raise PolicyError(
+            f"persistence failed: {original}; live state was not changed; {recovery}"
+        ) from original
+    try:
+        apply_live(entries, generation)
+    except PolicyError as original:
+        failures = []
+        try:
+            replace_state(previous_raw)
+        except OSError as fallback:
+            failures.append(f"durable rollback failed ({fallback})")
+        try:
+            apply_live(previous_entries, previous_generation)
+        except PolicyError as fallback:
+            failures.append(f"live rollback failed ({fallback})")
+        recovery = (
+            "prior durable and live state restored and verified"
+            if not failures else "UNRECONCILED: " + "; ".join(failures)
+        )
+        raise PolicyError(
+            f"live apply failed for generation {generation}: {original}; {recovery}"
+        ) from original
+    return generation
+
+
+def remaining(seconds):
+    units = []
+    for suffix, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        amount, seconds = divmod(seconds, size)
+        if amount or units:
+            units.append(f"{amount}{suffix}")
+    return "".join(units) or "0s"
+
+
+def device_for_ip(ip, records):
+    names = [record.get("hostname", "<unnamed>") for record in records if record.get("ip-address") == ip]
+    return names[0] if len(names) == 1 else "<unreserved>" if not names else "<ambiguous>"
+
+
+def bypass_inventory(entries, records, now=None):
+    now = int(time.time()) if now is None else now
+    return [
+        (
+            device_for_ip(ip, records),
+            ip,
+            "permanent" if value is None else "timed",
+            "-" if value is None else remaining(max(0, value - now)),
+            value,
+        )
+        for ip, value in sorted(entries.items(), key=lambda item: ipaddress.IPv4Address(item[0]))
+        if value is None or value > now
+    ]
+
+
+def list_policy(entries, generation, records, protected=False, leases=None):
+    try:
+        live, live_generation = live_state()
+    except (PolicyError, OSError) as error:
+        print(f"desired generation: {generation}")
+        print(f"live generation: unavailable ({error})")
+        live, live_generation = {}, None
+    synchronized = live_generation == generation and live == entries
+    if live_generation is not None:
+        print(f"desired generation: {generation}")
+        print(f"live generation:    {live_generation} ({'in sync' if synchronized else 'MISMATCH'})")
+    now = int(time.time())
+    if protected:
+        inventory = protected_inventory(entries, records, leases)
+        if not inventory:
+            print("No protected devices.")
+        else:
+            headers = ("DEVICE", "TYPE", "IP", "MAC", "DESIRED", "EFFECTIVE", "STATUS")
+            rows = []
+            for row in inventory:
+                effective = live.get(row["ip"], "absent")
+                effective_text = "unknown" if live_generation is None else (
+                    "protected" if effective == "absent" or (isinstance(effective, int) and effective <= now) else "bypass"
+                )
+                rows.append((
+                    row["hostname"], row["kind"], row["ip"], row["mac"], "protected", effective_text, row["status"]
+                ))
+            widths = [max(len(row[column]) for row in (headers, *rows)) for column in range(6)]
+            row_format = "  ".join(f"{{:<{width}}}" for width in widths) + "  {}"
+            print(row_format.format(*headers))
+            for row in rows:
+                print(row_format.format(*row))
+        return 0 if synchronized else 1
+
+    ips = sorted(set(entries) | set(live))
+    if not ips:
+        print("No bypass entries. Default policy: protected.")
+    else:
+        headers = ("DEVICE", "IP", "DESIRED", "EFFECTIVE", "EXPIRY / REMAINING")
+        rows = []
+        for ip in ips:
+            desired = entries.get(ip, "absent")
+            effective = live.get(ip, "absent")
+            desired_text = "protected" if desired == "absent" else "permanent" if desired is None else "timed"
+            effective_text = "unknown" if live_generation is None else (
+                "protected" if effective == "absent" or (isinstance(effective, int) and effective <= now) else "bypass"
+            )
+            expiry_value = desired if isinstance(desired, int) else effective if isinstance(effective, int) else None
+            expiry = "-" if expiry_value is None else (
+                f"{datetime.fromtimestamp(expiry_value, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} / "
+                f"{remaining(max(0, expiry_value - now))}"
+            )
+            rows.append((device_for_ip(ip, records), ip, desired_text, effective_text, expiry))
+        widths = [max(len(row[column]) for row in (headers, *rows)) for column in range(4)]
+        row_format = "  ".join(f"{{:<{width}}}" for width in widths) + "  {}"
+        print(row_format.format(*headers))
+        for row in rows:
+            print(row_format.format(*row))
+    return 0 if synchronized else 1
+
+
+def require_tty(input_stream, output_stream, operation="bypass"):
+    if not input_stream.isatty() or not output_stream.isatty():
+        raise PolicyError(f"interactive {operation} requires a TTY on both stdin and stdout")
+
+
+def read_prompt(prompt, input_stream, output_stream, operation="bypass"):
+    output_stream.write(prompt + " ")
+    output_stream.flush()
+    try:
+        line = input_stream.readline()
+    except KeyboardInterrupt as error:
+        output_stream.write("\n")
+        raise PolicyError(f"interactive {operation} cancelled") from error
+    if line == "":
+        raise PolicyError(f"interactive {operation} cancelled")
+    return line.strip()
+
+
+def prompt_policy_type(input_stream, output_stream):
+    while True:
+        choice = read_prompt("Temporary or permanent? [T/p]", input_stream, output_stream).lower()
+        if choice in ("", "t", "temp", "temporary"):
+            return "temporary"
+        if choice in ("p", "perm", "permanent"):
+            return "permanent"
+        output_stream.write("Enter T for temporary or P for permanent.\n")
+
+
+def prompt_selection(count, input_stream, output_stream, operation="bypass"):
+    while True:
+        choice = read_prompt("Device number:", input_stream, output_stream, operation)
+        if re.fullmatch(r"[1-9][0-9]*", choice) and len(choice) <= len(str(count)):
+            number = int(choice)
+            if number <= count:
+                return number - 1
+        output_stream.write(f"Enter a device number from 1 to {count}.\n")
+
+
+def minutes_expiry(value, now):
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise PolicyError("minutes must be a positive whole number")
+    if len(value) > len(str(MAX_EXPIRY)):
+        raise PolicyError("minutes overflow the supported Unix expiry range")
+    minutes = int(value)
+    if minutes > (MAX_EXPIRY - now) // 60:
+        raise PolicyError("minutes overflow the supported Unix expiry range")
+    return now + minutes * 60
+
+
+def prompt_minutes(input_stream, output_stream, now=None):
+    now = int(time.time()) if now is None else now
+    while True:
+        try:
+            return minutes_expiry(read_prompt("Minutes:", input_stream, output_stream), now)
+        except PolicyError as error:
+            if str(error) == "interactive bypass cancelled":
+                raise
+            output_stream.write(str(error).capitalize() + ".\n")
+
+
+def print_interactive_inventory(rows, output_stream):
+    headers = ("#", "DEVICE", "TYPE", "IP", "MAC", "STATUS")
+    values = [
+        (str(number), row["hostname"], row["kind"], row["ip"], row["mac"], row["status"])
+        for number, row in enumerate(rows, 1)
+    ]
+    widths = [max(len(row[column]) for row in (headers, *values)) for column in range(5)]
+    row_format = "  ".join(f"{{:<{width}}}" for width in widths) + "  {}\n"
+    output_stream.write(row_format.format(*headers))
+    for row in values:
+        output_stream.write(row_format.format(*row))
+    output_stream.flush()
+
+
+def print_bypass_inventory(rows, output_stream):
+    headers = ("#", "DEVICE", "IP", "POLICY", "REMAINING")
+    values = [(str(number), *row[:4]) for number, row in enumerate(rows, 1)]
+    widths = [max(len(row[column]) for row in (headers, *values)) for column in range(4)]
+    row_format = "  ".join(f"{{:<{width}}}" for width in widths) + "  {}\n"
+    output_stream.write(row_format.format(*headers))
+    for row in values:
+        output_stream.write(row_format.format(*row))
+    output_stream.flush()
+
+
+def reserve_interactive(input_stream, output_stream):
+    require_tty(input_stream, output_stream, "reserve")
+    config = read_kea_config()
+    records = reservation_records(config)
+    leases = active_leases()
+    rows = [row for row in protected_inventory({}, records, leases) if row["kind"] == "unreserved"]
+    if not rows:
+        raise PolicyError("no active unreserved Kea leases are available")
+    print_interactive_inventory(rows, output_stream)
+    selected = rows[prompt_selection(len(rows), input_stream, output_stream, "reserve")]
+    if selected["status"] == "ambiguous active MAC":
+        raise PolicyError(
+            f"selected lease {selected['ip']} has an ambiguous active MAC {selected['mac']}; refusing reservation"
+        )
+    lease = leases[selected["ip"]]
+    default = lease["hostname"] if valid_hostname(lease["hostname"]) else ""
+    while True:
+        prompt = f"Hostname [{default}]:" if default else "Hostname:"
+        hostname = read_prompt(prompt, input_stream, output_stream, "reserve") or default
+        if valid_hostname(hostname):
+            break
+        output_stream.write("Enter one lowercase DNS label (letters, digits, hyphens; max 63 characters).\n")
+    kea_reservation_candidate(config, lease, hostname)
+    if private_mac(lease["mac"]):
+        output_stream.write(
+            "Warning: this is a locally administered/private MAC and may be randomized.\n"
+        )
+        if read_prompt(
+            "Confirm this MAC is stable for this network by entering yes:",
+            input_stream,
+            output_stream,
+            "reserve",
+        ) != "yes":
+            raise PolicyError("interactive reserve cancelled")
+    output_stream.write(
+        f"Proposed reservation:\n  hostname: {hostname}\n  IP:       {lease['ip']}\n  MAC:      {lease['mac']}\n"
+    )
+    output_stream.flush()
+    if read_prompt("Create this reservation? Enter yes:", input_stream, output_stream, "reserve") != "yes":
+        raise PolicyError("interactive reserve cancelled")
+
+    active_reservation_candidate(lease["ip"], lease["mac"], hostname)
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/sudo", "--", "/usr/bin/python3", str(SCRIPT),
+                "--install-kea-reservation", lease["ip"], lease["mac"], hostname,
+            ],
+            check=False,
+        )
+    except OSError as error:
+        raise PolicyError(f"could not invoke sudo for Kea reservation: {error}") from error
+    if result.returncode:
+        raise PolicyError(f"Kea reservation installation failed with exit {result.returncode}")
+    print(
+        f"Reservation created for {hostname} ({lease['ip']}, {lease['mac']}). "
+        "Rerun dns-policy bypass to grant a bypass."
+    )
+    return 0
+
+
+def require_synchronized(entries, generation, operation="bypass"):
+    live, live_generation = live_state()
+    if live_generation != generation or live != entries:
+        raise PolicyError(f"interactive {operation} requires synchronized desired and live policy state")
+
+
+def usage():
+    print("usage:", file=sys.stderr)
+    print("  dns-policy list", file=sys.stderr)
+    print("  dns-policy list --protected", file=sys.stderr)
+    print("  dns-policy reserve", file=sys.stderr)
+    print("  dns-policy bypass", file=sys.stderr)
+    print("  dns-policy bypass DEVICE", file=sys.stderr)
+    print("  dns-policy bypass DEVICE --for DURATION", file=sys.stderr)
+    print("  dns-policy bypass DEVICE --permanent", file=sys.stderr)
+    print("  dns-policy protect", file=sys.stderr)
+    print("  dns-policy protect DEVICE", file=sys.stderr)
+    print("  Bypass grants are effective only when the device uses DNS 192.168.0.91.", file=sys.stderr)
+
+
+def self_check():
+    real_geteuid = os.geteuid
+    try:
+        os.geteuid = lambda: 0
+        try:
+            main(["bypass"])
+        except PolicyError as error:
+            assert "without sudo" in str(error), str(error)
+        else:
+            raise AssertionError("root policy invocation was accepted")
+    finally:
+        os.geteuid = real_geteuid
+
+    assert duration("1s") == 1
+    assert all(valid_hostname(value) for value in ("a", "host-1", "a" * 63))
+    assert not any(valid_hostname(value) for value in ("", "Host", "-host", "host-", "a" * 64, "host_name"))
+    assert private_mac("02:00:00:00:00:01") and not private_mac("00:00:00:00:00:01")
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *unused):
+            pass
+
+        def settimeout(self, unused):
+            pass
+
+        def connect(self, address):
+            assert isinstance(address, str)
+
+        def sendall(self, unused):
+            pass
+
+        def shutdown(self, unused):
+            pass
+
+        def recv(self, unused):
+            return b'{"result":0}'
+
+    real_socket = socket.socket
+    try:
+        socket.socket = lambda *unused: FakeSocket()
+        kea_control_reload()
+    finally:
+        socket.socket = real_socket
+
+    raw, generation = serialize({"192.0.2.1": None, "192.0.2.2": 2000000000})
+    assert parse_state(raw, now=1) == ({"192.0.2.1": None, "192.0.2.2": 2000000000}, generation, False)
+    try:
+        parse_state(raw.replace(b"\tpermanent", b"\tinvalid"), now=1)
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("state validation failed")
+
+    inventory = bypass_inventory(
+        {"192.0.2.10": 160, "192.0.2.2": None, "192.0.2.3": 130},
+        [
+            {"hostname": "timed-device", "ip-address": "192.0.2.10"},
+            {"hostname": "permanent-device", "ip-address": "192.0.2.2"},
+        ],
+        now=100,
+    )
+    assert [row[:4] for row in inventory] == [
+        ("permanent-device", "192.0.2.2", "permanent", "-"),
+        ("<unreserved>", "192.0.2.3", "timed", "30s"),
+        ("timed-device", "192.0.2.10", "timed", "1m0s"),
+    ]
+
+    header = "address,hwaddr,expire,hostname,state,subnet_id\n"
+    baseline = header + """192.0.2.1,00:00:00:00:00:01,200,old,0,7
+192.0.2.2,00:00:00:00:00:02,100,expired,0,7
+192.0.2.3,00:00:00:00:00:03,200,released,1,7
+192.0.2.4,00:00:00:00:00:04,200,trailing.,0,7
+192.0.2.5,00:00:00:00:00:05,200,,0,7
+192.0.2.6,00:00:00:00:00:66,200,duplicate-one,0,7
+192.0.2.7,00:00:00:00:00:66,200,duplicate-two,0,7
+192.0.2.9,00:00:00:00:00:99,200,mismatch,0,7
+192.0.2.11,00:00:00:00:00:11,200,bypassed-unreserved,0,7
+"""
+    current = header + """192.0.2.1,00:00:00:00:00:01,200,"new,name.",0,7
+192.0.2.1,00:00:00:00:00:01,200,"new,name.",0,7
+192.0.2.4,00:00:00:00:00:04,200,trailing.,1,7
+"""
+    leases = replay_leases((("baseline", baseline.encode()), ("current", current.encode())), now=100)
+    assert set(leases) == {"192.0.2.1", "192.0.2.5", "192.0.2.6", "192.0.2.7", "192.0.2.9", "192.0.2.11"}
+    assert leases["192.0.2.1"]["hostname"] == "new,name"
+    assert leases["192.0.2.5"]["hostname"] == ""
+    records = [
+        {"hostname": "reserved-one", "ip-address": "192.0.2.1", "hw-address": "00:00:00:00:00:01"},
+        {"hostname": "no-lease", "ip-address": "192.0.2.8", "hw-address": "00:00:00:00:00:08"},
+        {"hostname": "wrong-lease", "ip-address": "192.0.2.9", "hw-address": "00:00:00:00:00:09"},
+        {"hostname": "bypassed", "ip-address": "192.0.2.10", "hw-address": "00:00:00:00:00:10"},
+    ]
+    inventory = protected_inventory({"192.0.2.10": None, "192.0.2.11": None}, records, leases)
+    by_ip = {row["ip"]: row for row in inventory}
+    assert set(by_ip) == {"192.0.2.1", "192.0.2.5", "192.0.2.6", "192.0.2.7", "192.0.2.8", "192.0.2.9"}
+    assert by_ip["192.0.2.8"]["kind"] == "reserved" and by_ip["192.0.2.8"]["selectable"]
+    assert by_ip["192.0.2.5"]["hostname"] == "<unnamed>"
+    assert by_ip["192.0.2.6"]["status"] == by_ip["192.0.2.7"]["status"] == "ambiguous active MAC"
+    assert by_ip["192.0.2.9"]["status"] == "lease MAC mismatch" and not by_ip["192.0.2.9"]["selectable"]
+
+    fixture = {
+        "Dhcp4": {
+            "subnet4": [{
+                "id": 7,
+                "subnet": "192.0.2.0/24",
+                "reservations": [{
+                    "hw-address": "00:00:00:00:00:01",
+                    "ip-address": "192.0.2.1",
+                    "hostname": "existing",
+                }],
+            }],
+        },
+    }
+    fixture_before = copy.deepcopy(fixture)
+    lease = {"ip": "192.0.2.20", "mac": "02:ab:00:00:00:20", "subnet_id": 7}
+    candidate = kea_reservation_candidate(fixture, lease, "new-host")
+    expected = copy.deepcopy(fixture)
+    expected["Dhcp4"]["subnet4"][0]["reservations"].append({
+        "hw-address": lease["mac"], "ip-address": lease["ip"], "hostname": "new-host",
+    })
+    assert candidate == expected and fixture == fixture_before
+    for field, duplicate in (
+        ("ip-address", "192.0.2.20"),
+        ("hw-address", "02:AB:00:00:00:20"),
+        ("hostname", "NEW-HOST"),
+    ):
+        duplicated = copy.deepcopy(fixture)
+        duplicated["Dhcp4"]["subnet4"][0]["reservations"][0][field] = duplicate
+        try:
+            kea_reservation_candidate(duplicated, lease, "new-host")
+        except PolicyError:
+            pass
+        else:
+            raise AssertionError(f"duplicate reservation {field} was accepted")
+
+    output = io.StringIO()
+    assert prompt_policy_type(io.StringIO("invalid\n\n"), output) == "temporary"
+    assert prompt_policy_type(io.StringIO("P\n"), output) == "permanent"
+    assert prompt_selection(2, io.StringIO("x\n0\n3\n2\n"), output) == 1
+    assert prompt_minutes(io.StringIO("0\n1.5\n999999999999999999999999\n2\n"), output, now=100) == 220
+    for cancelled in (io.StringIO(""),):
+        try:
+            prompt_policy_type(cancelled, output)
+        except PolicyError as error:
+            assert "cancelled" in str(error)
+        else:
+            raise AssertionError("EOF did not cancel")
+
+    class Interrupted(io.StringIO):
+        def readline(self, *unused):
+            raise KeyboardInterrupt
+
+    try:
+        prompt_policy_type(Interrupted(), output)
+    except PolicyError as error:
+        assert "cancelled" in str(error)
+    else:
+        raise AssertionError("Ctrl-C did not cancel")
+
+    class NonTTY(io.StringIO):
+        def isatty(self):
+            return False
+
+    try:
+        require_tty(NonTTY(), NonTTY())
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("non-TTY interactive use was accepted")
+    print("internal checks passed")
+
+
+def main(argv):
+    if argv[:1] == ["--install-kea-reservation"]:
+        if len(argv) != 4:
+            raise PolicyError("invalid internal reservation installation arguments")
+        if os.geteuid() != 0:
+            raise PolicyError("internal reservation installation requires EUID 0")
+        return install_kea_reservation(*argv[1:])
+    if os.geteuid() == 0 and argv != ["--self-check"]:
+        raise PolicyError("run dns-policy without sudo to avoid root-owned policy state; reserve requests sudo when needed")
+    if argv == ["reserve"]:
+        return reserve_interactive(sys.stdin, sys.stdout)
+
+    list_protected = False
+    interactive = False
+    interactive_target = False
+    interactive_protect = False
+    expected_entries = expected_generation = expected_ip = None
+    interactive_type = None
+    if argv == ["--self-check"]:
+        self_check()
+        return 0
+    if argv == ["list"]:
+        action, target, value = "list", None, None
+    elif argv == ["list", "--protected"]:
+        action, target, value = "list", None, None
+        list_protected = True
+    elif argv == ["bypass"]:
+        require_tty(sys.stdin, sys.stdout)
+        interactive_type = prompt_policy_type(sys.stdin, sys.stdout)
+        action, target, value = "bypass", None, None
+        interactive = True
+    elif len(argv) == 2 and argv[0] == "bypass":
+        require_tty(sys.stdin, sys.stdout)
+        initial_records = reservations()
+        _, expected_ip = resolve_device(argv[1], initial_records)
+        try:
+            expected_entries, expected_generation, expected_pruned = parse_state(STATE.read_bytes())
+        except OSError as error:
+            raise PolicyError(f"cannot read policy state {STATE}: {error}") from error
+        if expected_pruned:
+            raise PolicyError("interactive bypass requires current policy state; run dns-policy list first")
+        require_synchronized(expected_entries, expected_generation)
+        action, target, value = "bypass", argv[1], prompt_minutes(sys.stdin, sys.stdout)
+        interactive_target = True
+    elif argv == ["protect"]:
+        require_tty(sys.stdin, sys.stdout, "protect")
+        action, target, value = "protect", None, None
+        interactive_protect = True
+    elif len(argv) == 2 and argv[0] == "protect":
+        action, target, value = "protect", argv[1], None
+    elif len(argv) == 3 and argv[0] == "bypass" and argv[2] == "--permanent":
+        action, target, value = "bypass", argv[1], None
+    elif len(argv) == 4 and argv[0] == "bypass" and argv[2] == "--for":
+        action, target, value = "bypass", argv[1], duration(argv[3])
+    else:
+        usage()
+        return 2
+
+    os.chmod(POLICY_DIR, 0o700)
+    lock_fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        records = reservations()
+        try:
+            entries, generation, pruned = parse_state(STATE.read_bytes())
+        except OSError as error:
+            raise PolicyError(f"cannot read policy state {STATE}: {error}") from error
+        if action == "list":
+            if pruned:
+                generation = persist_and_apply(entries)
+            leases = active_leases() if list_protected else None
+            return list_policy(entries, generation, records, list_protected, leases)
+        if interactive:
+            if pruned:
+                raise PolicyError("interactive bypass requires current policy state; run dns-policy list first")
+            require_synchronized(entries, generation)
+            inventory = protected_inventory(entries, records, active_leases())
+            if not inventory:
+                raise PolicyError("no desired-protected devices are available")
+            print_interactive_inventory(inventory, sys.stdout)
+            selected = inventory[prompt_selection(len(inventory), sys.stdin, sys.stdout)]
+            if selected["kind"] == "unreserved":
+                raise PolicyError(
+                    f"fixed Kea reservation required for {selected['hostname']} "
+                    f"({selected['ip']}, {selected['mac']}); refusing unsafe IP-only policy"
+                )
+            if not selected["selectable"]:
+                raise PolicyError(
+                    f"selected reserved device {selected['hostname']} ({selected['ip']}, {selected['mac']}) "
+                    f"is not selectable: {selected['status']}"
+                )
+            expiry = prompt_minutes(sys.stdin, sys.stdout) if interactive_type == "temporary" else None
+
+            current_records = reservations()
+            current_rows = protected_inventory(entries, current_records, active_leases())
+            current = next((row for row in current_rows if row["ip"] == selected["ip"]), None)
+            if not current or current["kind"] != "reserved" or not current["selectable"]:
+                raise PolicyError("selected reservation or lease status changed; no policy was changed")
+            name, ip = resolve_device(selected["ip"], current_records)
+            try:
+                current_entries, current_generation, current_pruned = parse_state(STATE.read_bytes())
+            except OSError as error:
+                raise PolicyError(f"cannot revalidate policy state {STATE}: {error}") from error
+            if current_pruned or current_generation != generation or current_entries != entries:
+                raise PolicyError("desired policy changed during interactive selection; no policy was changed")
+            require_synchronized(entries, generation)
+            entries[ip] = expiry
+            if expiry is None:
+                status = "permanent bypass"
+            else:
+                status = f"timed bypass for {remaining(max(0, expiry - int(time.time())))}"
+        elif interactive_target:
+            name, ip = resolve_device(target, records)
+            if ip != expected_ip:
+                raise PolicyError("selected reservation changed during interactive bypass; no policy was changed")
+            if pruned or generation != expected_generation or entries != expected_entries:
+                raise PolicyError("desired policy changed during interactive bypass; no policy was changed")
+            require_synchronized(entries, generation)
+            entries[ip] = value
+            status = f"timed bypass for {remaining(max(0, value - int(time.time())))}"
+        elif interactive_protect:
+            if pruned:
+                raise PolicyError("interactive protect requires current policy state; run dns-policy list first")
+            require_synchronized(entries, generation, "protect")
+            inventory = bypass_inventory(entries, records)
+            if not inventory:
+                raise PolicyError("no active desired bypass entries are available")
+            print_bypass_inventory(inventory, sys.stdout)
+            selected = inventory[prompt_selection(len(inventory), sys.stdin, sys.stdout, "protect")]
+            name, ip, _, _, selected_value = selected
+            try:
+                current_entries, current_generation, current_pruned = parse_state(STATE.read_bytes())
+            except OSError as error:
+                raise PolicyError(f"cannot revalidate policy state {STATE}: {error}") from error
+            if (
+                current_pruned
+                or current_generation != generation
+                or current_entries != entries
+                or ip not in current_entries
+                or current_entries[ip] != selected_value
+            ):
+                raise PolicyError("desired policy changed during interactive protect selection; no policy was changed")
+            require_synchronized(current_entries, current_generation, "protect")
+            entries = current_entries
+        else:
+            name, ip = resolve_device(target, records)
+        if action == "protect":
+            entries.pop(ip, None)
+            status = "protected"
+        elif interactive or interactive_target:
+            pass
+        elif value is None:
+            entries[ip] = None
+            status = "permanent bypass"
+        else:
+            entries[ip] = int(time.time()) + value
+            status = f"timed bypass for {remaining(value)}"
+        generation = persist_and_apply(entries)
+        if action == "bypass":
+            print(
+                "dns-policy: warning: bypass grant is effective only when the device uses DNS 192.168.0.91",
+                file=sys.stderr,
+            )
+        message = f"{name} ({ip}): {status}; persisted and live generation {generation}"
+        syslog.syslog(syslog.LOG_NOTICE, "dns-policy: " + message)
+        print(message)
+        return 0
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (PolicyError, OSError) as error:
+        syslog.syslog(syslog.LOG_ERR, "dns-policy: " + str(error))
+        print(f"dns-policy: error: {error}", file=sys.stderr)
+        raise SystemExit(1)

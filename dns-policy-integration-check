@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Safe live Phase 2 policy check. Run with: ./dns-policy-integration-check
+
+Recovery: a failed live apply rolls durable state back first, then best-effort
+restores live state. If output says UNRECONCILED, restore dnsdist availability,
+reapply the intended dns-policy operation, and require `dns-policy list` to pass.
+This check demonstrates that recovery after an interrupted update without
+editing policy.state directly.
+"""
+import errno
+import json
+import os
+import pty
+import runpy
+import secrets
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+CLI = ROOT / "dns-policy"
+TARGET_NAME = "living-room"
+TARGET_IP = "192.168.0.110"
+UNKNOWN_NAME = "dns-policy-check-unreserved"
+SEEDS = {
+    **{f"192.168.0.{last}": None for last in (111, 112)},
+    **{f"192.168.0.{last}": None for last in range(150, 158)},
+}
+DNSDIST = "dns-policy-staging-dnsdist-1"
+CONTAINERS = (DNSDIST,)
+loaded = runpy.run_path(str(CLI))
+policy = loaded["persist_and_apply"].__globals__
+controlled_starts = []
+cleanup_armed = False
+
+
+def run(command, expected=0, timeout=30):
+    result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+    if result.returncode != expected:
+        raise AssertionError(
+            f"{command[0]} returned {result.returncode}, expected {expected}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    return result
+
+
+def cli(*arguments, expected=0):
+    return run([str(CLI), *arguments], expected=expected)
+
+
+def interactive_cli(arguments, input_text, expected=0, timeout=30):
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [str(CLI), *arguments], stdin=slave, stdout=slave, stderr=slave, close_fds=True
+    )
+    os.close(slave)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        pending = input_text.encode("ascii")
+        while pending:
+            pending = pending[os.write(master, pending):]
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise AssertionError("interactive dns-policy timed out")
+            readable, _, _ = select.select([master], [], [], remaining)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError as error:
+                if error.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            output.extend(chunk)
+    finally:
+        os.close(master)
+    returncode = process.wait(timeout=5)
+    transcript = output.decode("utf-8", errors="replace")
+    if returncode != expected:
+        raise AssertionError(
+            f"interactive dns-policy returned {returncode}, expected {expected}: {transcript.strip()}"
+        )
+    return transcript
+
+
+def durable():
+    raw = policy["STATE"].read_bytes()
+    entries, generation, pruned = policy["parse_state"](raw)
+    return raw, entries, generation, pruned
+
+
+def assert_sync(expected, generation=None):
+    _, entries, desired_generation, pruned = durable()
+    live, live_generation = policy["live_state"]()
+    assert not pruned, "durable state contains expired entries"
+    assert entries == expected, f"unexpected durable policies: {entries!r}"
+    assert live == expected, f"unexpected live policies: {live!r}"
+    assert live_generation == desired_generation, "desired/live generation mismatch"
+    if generation is not None:
+        assert desired_generation == generation, "generation changed unexpectedly"
+    return desired_generation
+
+
+def inspect(name):
+    return json.loads(run(["docker", "inspect", name]).stdout)[0]
+
+
+def assert_healthy():
+    for name in CONTAINERS:
+        state = inspect(name)["State"]
+        assert state["Running"], f"{name} is not running"
+        if name != DNSDIST:
+            assert state.get("Health", {}).get("Status") == "healthy", f"{name} is not healthy"
+    policy["live_state"]()
+
+
+def wait_dnsdist(timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            policy["live_state"]()
+            return
+        except policy["PolicyError"]:
+            time.sleep(0.2)
+    raise AssertionError("staging dnsdist console did not become ready")
+
+
+def ensure_dnsdist():
+    if not inspect(DNSDIST)["State"]["Running"]:
+        started = time.monotonic()
+        run(["docker", "start", DNSDIST])
+        wait_dnsdist()
+        controlled_starts.append(("cleanup start", time.monotonic() - started))
+
+
+def pass_check(message):
+    print(f"PASS: {message}")
+
+
+def backend_queries():
+    output = policy["console"](
+        'local open, protected = 0, 0; '
+        'for _, server in ipairs(getPoolServers("open")) do open = open + server:getQueries() end; '
+        'for _, server in ipairs(getPoolServers("protected")) do protected = protected + server:getQueries() end; '
+        'return tostring(open) .. " " .. tostring(protected)'
+    )
+    return tuple(map(int, output.split()))
+
+
+def dns_query(source):
+    identifier = secrets.randbelow(65536)
+    labels = f"policy-check-{secrets.token_hex(6)}.example.com".split(".")
+    question = b"".join(bytes((len(label),)) + label.encode("ascii") for label in labels) + b"\0"
+    packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+        connection.bind((source, 0))
+        connection.settimeout(5)
+        connection.sendto(packet, ("192.168.0.91", 53))
+        response = connection.recv(4096)
+    assert len(response) >= 12 and struct.unpack("!H", response[:2])[0] == identifier
+
+
+def verify_routing():
+    for source, target, message in (
+        ("192.168.0.111", 0, ".111 did not route only to open"),
+        ("192.168.0.91", 1, ".91 did not route only to protected"),
+    ):
+        for _ in range(5):
+            before = backend_queries()
+            dns_query(source)
+            after = backend_queries()
+            delta = tuple(after[index] - before[index] for index in range(2))
+            if delta[target] == 1 and delta[1 - target] == 0:
+                break
+        else:
+            raise AssertionError(message)
+
+
+def safe_cleanup():
+    if not cleanup_armed:
+        return
+    ensure_dnsdist()
+    _, entries, _, pruned = durable()
+    try:
+        live, live_generation = policy["live_state"]()
+    except policy["PolicyError"]:
+        live, live_generation = {}, None
+    _, _, desired_generation, _ = durable()
+    if entries != SEEDS or pruned or live != SEEDS or live_generation != desired_generation:
+        policy["persist_and_apply"](SEEDS)
+    assert_sync(SEEDS)
+
+
+def main():
+    global cleanup_armed
+    if sys.argv[1:]:
+        if sys.argv[1:] == ["--help"]:
+            print(__doc__)
+            return
+        raise AssertionError("this check accepts no arguments")
+
+    initial = {name: inspect(name) for name in CONTAINERS}
+    assert_healthy()
+    records = policy["reservations"]()
+    assert policy["resolve_device"](TARGET_NAME, records) == (TARGET_NAME, TARGET_IP)
+    assert not any(record.get("hostname") == UNKNOWN_NAME for record in records)
+    original_raw, entries, generation, pruned = durable()
+    assert TARGET_IP not in entries, ".110 already has policy; refusing to run"
+    assert not pruned and entries == SEEDS, "preflight requires exactly the ten permanent seeded entries"
+    assert_sync(SEEDS, generation)
+    cleanup_armed = True
+    pass_check("preflight exact ten permanent seeds and desired/live synchronization")
+
+    before_raw = durable()[0]
+    before_live = policy["live_state"]()
+    for arguments, operation in ((("bypass", TARGET_NAME), "bypass"), (("protect",), "protect")):
+        result = subprocess.run([str(CLI), *arguments], input=b"", capture_output=True, check=False)
+        assert result.returncode == 1
+        assert result.stdout == b""
+        assert result.stderr == (
+            f"dns-policy: error: interactive {operation} requires a TTY on both stdin and stdout\n".encode("ascii")
+        )
+        assert durable()[0] == before_raw and policy["live_state"]() == before_live
+    pass_check("new interactive forms reject non-TTY use byte-exactly without state change")
+
+    for arguments, operation in ((("bypass", TARGET_NAME), "bypass"), (("protect",), "protect")):
+        before_raw = durable()[0]
+        before_live = policy["live_state"]()
+        transcript = interactive_cli(arguments, "\x04", expected=1)
+        assert f"interactive {operation} cancelled" in transcript
+        assert durable()[0] == before_raw and policy["live_state"]() == before_live
+    pass_check("EOF cancels both new interactive forms without state change")
+
+    before_live = policy["live_state"]()
+    result = cli("bypass", UNKNOWN_NAME, "--permanent", expected=1)
+    assert "unknown or unreserved device" in result.stderr
+    assert durable()[0] == original_raw and policy["live_state"]() == before_live
+    pass_check("unknown/unreserved target rejected without state change")
+
+    original_write = policy["write_state"]
+    try:
+        policy["write_state"] = lambda unused: (_ for _ in ()).throw(OSError("injected write failure"))
+        try:
+            policy["persist_and_apply"]({**SEEDS, TARGET_IP: None})
+        except policy["PolicyError"] as error:
+            assert "live state was not changed" in str(error)
+        else:
+            raise AssertionError("injected persistence failure succeeded")
+    finally:
+        policy["write_state"] = original_write
+    assert durable()[0] == original_raw and policy["live_state"]() == before_live
+    pass_check("persistence failure preserves prior durable and live state")
+
+    rows = policy["protected_inventory"](SEEDS, records, policy["active_leases"]())
+    target_number = next(number for number, row in enumerate(rows, 1) if row["ip"] == TARGET_IP)
+    transcript = interactive_cli(("bypass",), f"p\n{target_number}\n")
+    assert "Temporary or permanent? [T/p]" in transcript
+    assert "Device number:" in transcript and "permanent bypass" in transcript
+    assert "DNS 192.168.0.91" in transcript
+    assert_sync({**SEEDS, TARGET_IP: None})
+    cli("protect", TARGET_NAME)
+    assert_sync(SEEDS)
+    pass_check("PTY interactive permanent grant used a protected fixed reservation and cleaned up")
+
+    transcript = interactive_cli(("bypass", TARGET_NAME), "1\n")
+    assert "Minutes:" in transcript
+    assert "Temporary or permanent?" not in transcript and "Device number:" not in transcript
+    _, timed_entries, _, _ = durable()
+    deadline = timed_entries[TARGET_IP]
+    assert 55 <= deadline - int(time.time()) <= 60
+    assert_sync({**SEEDS, TARGET_IP: deadline})
+
+    rows = policy["bypass_inventory"](timed_entries, records)
+    target_number = next(number for number, row in enumerate(rows, 1) if row[1] == TARGET_IP)
+    transcript = interactive_cli(("protect",), f"{target_number}\n")
+    lines = [line.split() for line in transcript.replace("\r", "").splitlines()]
+    assert ["#", "DEVICE", "IP", "POLICY", "REMAINING"] in lines
+    target_row = next(line for line in lines if TARGET_IP in line)
+    assert target_row[:4] == [str(target_number), TARGET_NAME, TARGET_IP, "timed"] and len(target_row) == 5
+    assert f"{TARGET_NAME} ({TARGET_IP}): protected; persisted and live generation" in transcript
+    assert_sync(SEEDS)
+    pass_check("targeted PTY minute bypass was timed and bare PTY protect removed only its .110 row")
+
+    cli("bypass", TARGET_NAME, "--permanent")
+    assert_sync({**SEEDS, TARGET_IP: None})
+    cli("bypass", TARGET_NAME, "--for", "20s")
+    _, entries, _, _ = durable()
+    first_deadline = entries[TARGET_IP]
+    assert 15 <= first_deadline - int(time.time()) <= 20
+    cli("bypass", TARGET_NAME, "--for", "3s")
+    _, entries, _, _ = durable()
+    short_deadline = entries[TARGET_IP]
+    assert int(time.time()) < short_deadline < first_deadline
+    time.sleep(max(0, short_deadline - time.time() + 0.2))
+    cli("list")
+    assert_sync(SEEDS)
+    pass_check("permanent grant, timed replacement, shortening, and natural expiry")
+
+    cli("bypass", TARGET_NAME, "--permanent")
+    cli("protect", TARGET_NAME)
+    assert_sync(SEEDS)
+    pass_check("explicit protect/revocation")
+
+    cli("bypass", TARGET_NAME, "--for", "12s")
+    timed_raw, timed_entries, timed_generation, _ = durable()
+    deadline = timed_entries[TARGET_IP]
+    started = time.monotonic()
+    run(["docker", "restart", "--time", "1", DNSDIST], timeout=20)
+    wait_dnsdist()
+    controlled_starts.append(("timed-grant restart", time.monotonic() - started))
+    assert durable()[0] == timed_raw
+    assert_sync({**SEEDS, TARGET_IP: deadline}, timed_generation)
+    assert deadline > int(time.time()), "timed grant expired before restart recovery was verified"
+    time.sleep(max(0, deadline - time.time() + 0.2))
+    cli("list")
+    cli("protect", TARGET_NAME)
+    assert_sync(SEEDS)
+    pass_check("restart recovered unexpired grant with its absolute deadline, then expired/protected")
+
+    cli("bypass", TARGET_NAME, "--permanent")
+    _, intended, intended_generation, _ = durable()
+    mismatch_generation = secrets.token_hex(32)
+    assert mismatch_generation != intended_generation
+    policy["apply_live"](intended, mismatch_generation)
+    mismatch = cli("list", expected=1)
+    assert "MISMATCH" in mismatch.stdout
+    cli("bypass", TARGET_NAME, "--permanent")
+    assert_sync(intended)
+    cli("protect", TARGET_NAME)
+    assert_sync(SEEDS)
+    pass_check("interrupted-generation mismatch detected; intended operation reapplied to recover")
+
+    prior_raw, _, prior_generation, _ = durable()
+    started = time.monotonic()
+    run(["docker", "stop", "--time", "1", DNSDIST], timeout=10)
+    failure = cli("bypass", TARGET_NAME, "--permanent", expected=1)
+    assert "live apply failed" in failure.stderr and "UNRECONCILED" in failure.stderr
+    assert durable()[0] == prior_raw, "failed live apply did not restore prior durable bytes"
+    run(["docker", "start", DNSDIST])
+    wait_dnsdist()
+    controlled_starts.append(("console-unavailable stop/start", time.monotonic() - started))
+    assert_sync(SEEDS, prior_generation)
+    pass_check("console-unavailable update failed nonzero; byte-exact durable rollback loaded on restart")
+
+    verify_routing()
+    pass_check("source .111 routed open and unlisted .91 routed protected")
+
+    safe_cleanup()
+    assert_healthy()
+    for name in CONTAINERS[1:]:
+        before = initial[name]
+        after = inspect(name)
+        assert after["RestartCount"] == before["RestartCount"]
+        assert after["State"]["StartedAt"] == before["State"]["StartedAt"], f"unexpected restart: {name}"
+    assert not list(policy["POLICY_DIR"].glob(".policy.state.*")), "temporary state artifact remains"
+    final_generation = assert_sync(SEEDS)
+    pass_check("dnsdist healthy; no unexpected restarts or artifacts")
+    for reason, seconds in controlled_starts:
+        print(f"CONTROLLED DNSDIST START: {reason}: {seconds:.2f}s")
+    print(f"FINAL: ten permanent entries; desired/live generation {final_generation}")
+
+
+if __name__ == "__main__":
+    failure = None
+    try:
+        main()
+    except BaseException as error:
+        failure = error
+        traceback.print_exc()
+    finally:
+        try:
+            safe_cleanup()
+        except BaseException as cleanup_error:
+            print(f"CLEANUP FAILURE: {cleanup_error}", file=sys.stderr)
+            failure = failure or cleanup_error
+    raise SystemExit(1 if failure else 0)

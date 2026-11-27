@@ -2,7 +2,7 @@ name: dns-policy-staging
 
 services:
   dnsdist:
-    image: powerdns/dnsdist-21@sha256:28100b260120b2f4fdcef6e973f5553966977c2ec4576ed2d849b1dc9d3278ea
+    image: powerdns/dnsdist-21:2.1.4@sha256:ec1347acec79e331b70516ca34a97f19f9f7e193fdd0010431278a9c21817d23
     user: "0:0"
     entrypoint:
       - /usr/bin/setpriv
